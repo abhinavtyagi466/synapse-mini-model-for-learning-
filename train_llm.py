@@ -14,18 +14,18 @@ eval_iters = 100
 vocab_size = 1500 # More tokens for better sentence structure
 
 # 1. Load Data
-data_file = 'chat_data.txt'
+data_file = 'synapse_data.txt'
 if not os.path.exists(data_file):
-    print(f"Error: {data_file} not found. Running prepare_data.py...")
-    os.system("python prepare_data.py")
+    print(f"Error: {data_file} not found. Running create_synapse_data.py...")
+    os.system("python create_synapse_data.py")
 
 with open(data_file, 'r', encoding='utf-8') as f:
     text = f.read()
 
 # 2. Tokenizer Setup
-tokenizer = ProTokenizer(state_file="chat_tokenizer.json")
+tokenizer = ProTokenizer(state_file="synapse_tokenizer.json")
 # Train tokenizer if not already trained
-if not os.path.exists("chat_tokenizer.json"):
+if not os.path.exists("synapse_tokenizer.json"):
     print("Training conversational tokenizer...")
     tokenizer.train(text, target_vocab_size=vocab_size)
 else:

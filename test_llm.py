@@ -5,7 +5,7 @@ from tiny_gpt import TinyGPT
 # Config
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model_path = 'tiny_llm.pth'
-tokenizer_path = 'chat_tokenizer.json'
+tokenizer_path = 'synapse_tokenizer.json'
 
 # 1. Load Tokenizer
 tokenizer = ProTokenizer(state_file=tokenizer_path)
