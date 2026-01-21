@@ -41,32 +41,113 @@ class ProTokenizer:
         return newids
 
     def train(self, text, target_vocab_size, verbose=True):
-        if verbose: print(f"Training Professional BPE to size {target_vocab_size}...")
+        if verbose: print(f"Training Professional BPE (Turbo Mode) to size {target_vocab_size}...")
         
-        # Pre-tokenize: Split text into logical chunks using the Regex
-        # This is CRITICAL for production LLMs.
+        # 1. Pre-tokenize
         text_chunks = re.findall(self.compiled_pattern, text)
-        ids_list = [list(chunk.encode("utf-8")) for chunk in text_chunks]
+        all_ids = []
+        for chunk in text_chunks:
+            # We use a special marker -1 to prevent merging across chunks
+            all_ids.extend(list(chunk.encode("utf-8")))
+            all_ids.append(-1)
         
-        current_vocab_size = len(self.vocab)
+        if not all_ids: return
+
+        # 2. Setup Doubly Linked List
+        # pointers[i] = [prev_idx, next_idx, value]
+        n = len(all_ids)
+        prev_ptrs = list(range(-1, n-1))
+        next_ptrs = list(range(1, n)) + [-1]
+        values = all_ids
+        
+        # 3. Initialize Stats (Pair -> List of positions)
+        # Position 'i' means the pair starts at index 'i' in the 'values' list
+        pair_pos = {}
+        def add_pair(i):
+            v1 = values[i]
+            nxt = next_ptrs[i]
+            if nxt != -1:
+                v2 = values[nxt]
+                if v1 != -1 and v2 != -1: # Don't merge across chunk boundaries
+                    p = (v1, v2)
+                    if p not in pair_pos: pair_pos[p] = set()
+                    pair_pos[p].add(i)
+
+        for i in range(n-1):
+            add_pair(i)
+
+        current_vocab_size = 256
         num_merges = target_vocab_size - current_vocab_size
         
         for i in range(num_merges):
-            stats = self.get_stats(ids_list)
-            if not stats: break
+            if not pair_pos: break
             
-            # Rank-based: The most frequent pair gets the next rank
-            best_pair = max(stats, key=stats.get)
-            new_id = current_vocab_size + i
+            # Find the most frequent pair
+            # We need to filter out pairs that have count 0
+            # To be efficient, we'll find top pair by count (size of set)
+            best_pair = max(pair_pos, key=lambda p: len(pair_pos[p]))
+            if len(pair_pos[best_pair]) == 0:
+                del pair_pos[best_pair]
+                continue
             
-            if verbose: print(f"Rank {new_id}: Merging {best_pair} (freq: {stats[best_pair]})")
-            
+            new_id = len(self.vocab)
             self.merges[best_pair] = new_id
             self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
             
-            # Update all chunks
-            ids_list = [self.merge_chunk(ids, best_pair, new_id) for ids in ids_list]
-        
+            if verbose and i % 500 == 0:
+                print(f"Merge {i}/{num_merges}: {best_pair} -> {new_id} (count {len(pair_pos[best_pair])})")
+
+            # Perform Merges and update neighbors
+            positions = list(pair_pos[best_pair])
+            # Sort positions to handle overlapping merges like AAA -> AA correctly
+            # Actually, the set.pop/remove already handles it if we are careful
+            # But sorting helps ensure we don't try to merge a token that was already merged
+            positions.sort()
+            
+            for pos in positions:
+                # check if this position is still valid (not already merged by neighbor)
+                if pos not in pair_pos.get(best_pair, set()): continue
+                
+                nxt = next_ptrs[pos]
+                if nxt == -1: continue
+                # The tokens being merged are values[pos] and values[nxt]
+                
+                # Neighbors: L -> [pos] -> [nxt] -> R
+                L = prev_ptrs[pos]
+                R = next_ptrs[nxt]
+                
+                # 1. Remove old pairs involving L, pos, nxt, R
+                # Pair (L, pos)
+                if L != -1:
+                    p_L = (values[L], values[pos])
+                    if p_L in pair_pos: 
+                        pair_pos[p_L].discard(L)
+                # Pair (pos, nxt) -> this is best_pair
+                pair_pos[best_pair].discard(pos)
+                # Pair (nxt, R)
+                if R != -1:
+                    p_R = (values[nxt], values[R])
+                    if p_R in pair_pos:
+                        pair_pos[p_R].discard(nxt)
+                
+                # 2. Perform merge
+                values[pos] = new_id
+                next_ptrs[pos] = R
+                if R != -1:
+                    prev_ptrs[R] = pos
+                # nxt is now effectively deleted
+                
+                # 3. Add new pairs (L, pos) and (pos, R)
+                add_pair(pos) # handles (pos, R)
+                if L != -1:
+                    add_pair(L) # handles (L, pos)
+            
+            # Cleanup best_pair if empty
+            if best_pair in pair_pos and not pair_pos[best_pair]:
+                del pair_pos[best_pair]
+            
+            current_vocab_size += 1
+
         self.save()
 
     def encode(self, text):

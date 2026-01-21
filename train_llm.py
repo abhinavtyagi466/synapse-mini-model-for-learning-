@@ -1,97 +1,197 @@
 import torch
-import os
+import torch.nn as nn
+from torch.nn import functional as F
 from bpe_tokenizer import ProTokenizer
-from tiny_gpt import TinyGPT
 
-# Hyperparameters
+# --- Hyperparameters ---
 batch_size = 32
-block_size = 128 # Increased context
-max_iters = 7000 # More training for identity
+block_size = 64 # Context length
+max_iters = 5000
 eval_interval = 500
-learning_rate = 5e-4 # Slightly lower for stability
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 100
-vocab_size = 1500 # More tokens for better sentence structure
+eval_iters = 200
+n_embd = 128
+n_head = 4
+n_layer = 12
+dropout = 0.2
+vocab_size = 5000 
+# -----------------------
 
-# 1. Load Data
-data_file = 'synapse_data.txt'
-if not os.path.exists(data_file):
-    print(f"Error: {data_file} not found. Running create_synapse_data.py...")
-    os.system("python create_synapse_data.py")
+tokenizer = ProTokenizer()
 
-with open(data_file, 'r', encoding='utf-8') as f:
-    text = f.read()
+class Head(nn.Module):
+    """ one head of self-attention """
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
-# 2. Tokenizer Setup
-tokenizer = ProTokenizer(state_file="synapse_tokenizer.json")
-# Train tokenizer if not already trained
-if not os.path.exists("synapse_tokenizer.json"):
-    print("Training conversational tokenizer...")
-    tokenizer.train(text, target_vocab_size=vocab_size)
-else:
-    print("Loading existing chat tokenizer...")
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)   # (B,T,hs)
+        q = self.query(x) # (B,T,hs)
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x) # (B,T,hs)
+        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
 
-# Encode the entire dataset
-print("Tokenizing chat dataset...")
-data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-n = int(0.9 * len(data)) 
-train_data = data[:n]
-val_data = data[n:]
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
-# Data loading
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+class FeedFoward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
 
-# 3. Model Initialization
-# Update vocab_size to actual tokenizer vocab size
-actual_vocab_size = len(tokenizer.vocab)
-print(f"Actual Vocab Size: {actual_vocab_size}")
-model = TinyGPT(vocab_size=actual_vocab_size, block_size=block_size, device=device).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    def forward(self, x):
+        return self.net(x)
 
-# 4. Training Loop
-print("Starting training...")
-for iter in range(max_iters):
+class ChildishBlock(nn.Module):
+    """ Transformer block: communication followed by computation """
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
-    # sample a batch of data
-    xb, yb = get_batch('train')
+class ChildishGPT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[ChildishBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.apply(self._init_weights)
 
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-# 5. Save the model
-torch.save(model.state_dict(), 'tiny_llm.pth')
-print("Model saved to tiny_llm.pth")
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
+        x = self.ln_f(x) # (B,T,C)
+        logits = self.lm_head(x) # (B,T,vocab_size)
 
-# 6. Test Generation
-print("\n--- Generating some text ---")
-context = torch.zeros((1, 1), dtype=torch.long, device=device) # Start with token 0 (usually a byte)
-generated_ids = model.generate(context, max_new_tokens=100)[0].tolist()
-print(tokenizer.decode(generated_ids))
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+# --- Data Loading ---
+try:
+    with open('input.txt', 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    print("Encoding dataset...")
+    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    n = int(0.9*len(data))
+    train_data = data[:n]
+    val_data = data[n:]
+
+    def get_batch(split):
+        data_source = train_data if split == 'train' else val_data
+        ix = torch.randint(len(data_source) - block_size, (batch_size,))
+        x = torch.stack([data_source[i:i+block_size] for i in ix])
+        y = torch.stack([data_source[i+1:i+block_size+1] for i in ix])
+        x, y = x.to(device), y.to(device)
+        return x, y
+
+    @torch.no_grad()
+    def estimate_loss(model):
+        out = {}
+        model.eval()
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+        model.train()
+        return out
+
+    # --- Training Loop ---
+    model = ChildishGPT().to(device)
+    print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    for iter in range(max_iters):
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss(model)
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+        xb, yb = get_batch('train')
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    torch.save(model.state_dict(), 'childish_llm.pth')
+
+    # --- Final Generation ---
+    print("\n--- Final Generated Text ---")
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    generated = model.generate(context, max_new_tokens=100)
+    print(tokenizer.decode(generated[0].tolist()))
+
+except FileNotFoundError:
+    print("Error: input.txt not found. Please provide training data.")
+except Exception as e:
+    print(f"An error occurred: {e}")
