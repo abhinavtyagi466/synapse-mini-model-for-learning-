@@ -5,7 +5,7 @@ from bpe_tokenizer import ProTokenizer
 
 # --- Hyperparameters ---
 batch_size = 32
-block_size = 64 # Context length
+block_size = 64
 max_iters = 5000
 eval_interval = 500
 learning_rate = 3e-4
@@ -133,65 +133,68 @@ class ChildishGPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-# --- Data Loading ---
-try:
-    with open('input.txt', 'r', encoding='utf-8') as f:
-        text = f.read()
+if __name__ == "__main__":
+    # --- Data Loading ---
+    try:
+        with open('input_v6.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
 
-    print("Encoding dataset...")
-    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-    n = int(0.9*len(data))
-    train_data = data[:n]
-    val_data = data[n:]
+        print("Encoding dataset...")
+        data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+        n = int(0.9*len(data))
+        train_data = data[:n]
+        val_data = data[n:]
 
-    def get_batch(split):
-        data_source = train_data if split == 'train' else val_data
-        ix = torch.randint(len(data_source) - block_size, (batch_size,))
-        x = torch.stack([data_source[i:i+block_size] for i in ix])
-        y = torch.stack([data_source[i+1:i+block_size+1] for i in ix])
-        x, y = x.to(device), y.to(device)
-        return x, y
+        def get_batch(split):
+            data_source = train_data if split == 'train' else val_data
+            ix = torch.randint(len(data_source) - block_size, (batch_size,))
+            x = torch.stack([data_source[i:i+block_size] for i in ix])
+            y = torch.stack([data_source[i+1:i+block_size+1] for i in ix])
+            x, y = x.to(device), y.to(device)
+            return x, y
 
-    @torch.no_grad()
-    def estimate_loss(model):
-        out = {}
-        model.eval()
-        for split in ['train', 'val']:
-            losses = torch.zeros(eval_iters)
-            for k in range(eval_iters):
-                X, Y = get_batch(split)
-                logits, loss = model(X, Y)
-                losses[k] = loss.item()
-            out[split] = losses.mean()
-        model.train()
-        return out
+        @torch.no_grad()
+        def estimate_loss(model):
+            out = {}
+            model.eval()
+            for split in ['train', 'val']:
+                losses = torch.zeros(eval_iters)
+                for k in range(eval_iters):
+                    X, Y = get_batch(split)
+                    logits, loss = model(X, Y)
+                    losses[k] = loss.item()
+                out[split] = losses.mean()
+            model.train()
+            return out
 
-    # --- Training Loop ---
-    model = ChildishGPT().to(device)
-    print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+        # --- Training Loop ---
+        model = ChildishGPT().to(device)
+        print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    for iter in range(max_iters):
-        if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model)
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        for iter in range(max_iters):
+            if iter % eval_interval == 0 or iter == max_iters - 1:
+                losses = estimate_loss(model)
+                print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                # Checkpoint saving
+                torch.save(model.state_dict(), 'synapse_v2.pth')
 
-        xb, yb = get_batch('train')
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+            xb, yb = get_batch('train')
+            logits, loss = model(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-    torch.save(model.state_dict(), 'childish_llm.pth')
+        torch.save(model.state_dict(), 'synapse_v2.pth')
 
-    # --- Final Generation ---
-    print("\n--- Final Generated Text ---")
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    generated = model.generate(context, max_new_tokens=100)
-    print(tokenizer.decode(generated[0].tolist()))
+        # --- Final Generation ---
+        print("\n--- Final Generated Text ---")
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+        generated = model.generate(context, max_new_tokens=100)
+        print(tokenizer.decode(generated[0].tolist()))
 
-except FileNotFoundError:
-    print("Error: input.txt not found. Please provide training data.")
-except Exception as e:
-    print(f"An error occurred: {e}")
+    except FileNotFoundError:
+        print("Error: input_v3.txt not found. Please provide training data.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
